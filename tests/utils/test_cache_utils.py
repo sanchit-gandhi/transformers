@@ -19,6 +19,7 @@ from packaging import version
 from parameterized import parameterized
 
 from transformers import set_seed
+from transformers.cache_utils import HybridCache
 from transformers.testing_utils import (
     is_torch_available,
     require_auto_gptq,
@@ -210,6 +211,60 @@ class CacheTest(unittest.TestCase):
                     position_ids=input_pos.unsqueeze(0),
                     cache_position=input_pos,
                     past_key_values=self.static_cache,
+                    use_cache=True,
+                )
+                return outs.logits
+
+        set_seed(0)
+        with torch.no_grad():
+            from torch.export import ExportedProgram, export
+
+            model = ExportatibleModelWithStaticCache(config, m)
+            exported_program = export(model, args=(inputs,), kwargs={"input_pos": torch.arange(1)})
+            self.assertTrue(isinstance(exported_program, ExportedProgram))
+    @slow
+    @require_read_token
+    def test_hybrid_cache_exportability(self):
+        """
+        Tests that hybrid cache works with `torch.export()`
+        """
+        if version.parse(torch.__version__) < version.parse("2.3"):
+            self.skipTest(reason="This test requires torch >= 2.3 to run.")
+
+        device = "cpu"
+        dtype = torch.float32
+        max_batch_size = 1
+
+        config = AutoConfig.from_pretrained(
+            "google/gemma-2-9b",
+            torch_dtype=dtype,
+            use_cache=True,
+        )
+        m = AutoModelForCausalLM.from_pretrained(
+            "google/gemma-2-9b",
+            config=config,
+            torch_dtype=dtype,
+            attn_implementation="sdpa",  # Export and ExecuTorch only works for SdpaAttention
+        ).to(device)
+        tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-9b",)
+        inputs = tokenizer(["The best color is"], return_tensors="pt").to(device)["input_ids"]
+
+        class ExportatibleModelWithStaticCache(torch.nn.Module):
+            def __init__(self, config, model):
+                super().__init__()
+                self.config = config
+                self.model = model
+                self.hybrid_cache = HybridCache(
+                    config=config, max_batch_size=max_batch_size, max_cache_len=config.max_length, device=device
+                )
+
+            def forward(self, tokens: torch.Tensor, input_pos: torch.Tensor):
+                outs = self.model(
+                    input_ids=tokens,
+                    attention_mask=None,
+                    position_ids=input_pos.unsqueeze(0),
+                    cache_position=input_pos,
+                    past_key_values=self.hybrid_cache,
                     use_cache=True,
                 )
                 return outs.logits

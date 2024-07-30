@@ -1189,16 +1189,23 @@ class HybridCache(Cache):
             min(config.sliding_window, max_cache_len),
             self.head_dim,
         )
-        for i in range(config.num_hidden_layers):
+        for idx in range(config.num_hidden_layers):
             # Note: `mark_static_address` is used to tag the cache as an fixed data pointer, preventing cuda graph
             # breaks when updating the cache.
-            cache_shape = global_cache_shape if not self.is_sliding[i] else sliding_cache_shape
-            new_layer_key_cache = torch.zeros(cache_shape, dtype=self.dtype, device=device)
-            new_layer_value_cache = torch.zeros(cache_shape, dtype=self.dtype, device=device)
-            torch._dynamo.mark_static_address(new_layer_key_cache)
-            torch._dynamo.mark_static_address(new_layer_value_cache)
-            self.key_cache.append(new_layer_key_cache)
-            self.value_cache.append(new_layer_value_cache)
+            cache_shape = global_cache_shape if not self.is_sliding[idx] else sliding_cache_shape
+            # Note: `torch.export()`` requires mutations to be registered as buffers.
+            self.register_buffer(f"key_cache_{idx}", torch.zeros(cache_shape, dtype=dtype, device=device))
+            self.register_buffer(f"value_cache_{idx}", torch.zeros(cache_shape, dtype=dtype, device=device))
+            key_cache = getattr(self, f"key_cache_{idx}")
+            value_cache = getattr(self, f"value_cache_{idx}")
+            # Note: `mark_static_address` is used to tag the cache as a fixed data pointer, preventing cuda graph
+            # breaks when updating the cache. It can't be used if the cache code is being compiled (but in that case
+            # it is not needed anyway)
+            if not is_torchdynamo_compiling():
+                torch._dynamo.mark_static_address(key_cache)
+                torch._dynamo.mark_static_address(value_cache)
+            self.key_cache.append(key_cache)
+            self.value_cache.append(value_cache)
 
     def _sliding_update(self, cache_position, layer_idx, key_states, value_states, k_out, v_out, max_cache_len):
         if cache_position.shape[0] > max_cache_len:
